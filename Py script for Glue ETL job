@@ -1,0 +1,144 @@
+"""
+Glue ETL Job: Sentiment Analysis Pipeline using SageMaker Hugging Face Endpoint
+
+🔹 Reads customer reviews from the AWS Glue Data Catalog
+🔹 Combines review title and body for sentiment inference
+🔹 Invokes a deployed Hugging Face model on SageMaker for sentiment classification
+🔹 Writes the enriched data with sentiment labels back to S3 in Parquet format
+"""
+
+import sys
+import boto3
+import json
+from awsglue.transforms import DropFields
+from awsglue.utils import getResolvedOptions
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.job import Job
+from awsgluedq.transforms import EvaluateDataQuality
+from awsglue.dynamicframe import DynamicFrame
+from pyspark.sql.functions import udf, concat_ws
+from pyspark.sql.types import StringType
+
+# ----------------------------
+# Initialize Glue Context
+# ----------------------------
+
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+job = Job(glueContext)
+job.init(args['JOB_NAME'], args)
+
+# ----------------------------
+# Define Data Quality Rule
+# ----------------------------
+
+DEFAULT_DATA_QUALITY_RULESET = """
+    Rules = [
+        ColumnCount > 0
+    ]
+"""
+
+# ----------------------------
+# Step 1: Read Data from Glue Catalog
+# ----------------------------
+
+input_dyf = glueContext.create_dynamic_frame.from_catalog(
+    database="sentiment_pipeline_db",
+    table_name="reviews",
+    transformation_ctx="read_from_catalog"
+)
+
+# ----------------------------
+# Step 2: Drop Unused Columns
+# ----------------------------
+
+dropped_dyf = DropFields.apply(
+    frame=input_dyf,
+    paths=["polarity"],
+    transformation_ctx="drop_fields"
+)
+
+# ----------------------------
+# Step 3: Convert to DataFrame
+# ----------------------------
+
+df = dropped_dyf.toDF()
+
+# ----------------------------
+# Step 4: Combine Heading and Review Text
+# ----------------------------
+
+df = df.withColumn("combined_text", concat_ws(". ", df["heading"], df["review"]))
+
+# ----------------------------
+# Step 5: Define UDF for SageMaker Sentiment Inference
+# ----------------------------
+
+def get_sentiment(text):
+    try:
+        if text:
+            sm_client = boto3.client('sagemaker-runtime', region_name='ap-south-1')
+            response = sm_client.invoke_endpoint(
+                EndpointName='hf-sentiment-endpoint',  # Update if different
+                ContentType='application/json',
+                Body=json.dumps({"inputs": text[:512]})
+            )
+            result = json.loads(response['Body'].read().decode())
+            return result[0]['label']
+    except Exception:
+        return "ERROR"
+    return "NEUTRAL"
+
+# Register the UDF
+get_sentiment_udf = udf(get_sentiment, StringType())
+
+# Apply UDF to each row
+df = df.withColumn("sentiment", get_sentiment_udf(df["combined_text"]))
+
+# ----------------------------
+# Step 6: Convert Back to DynamicFrame
+# ----------------------------
+
+output_dyf = DynamicFrame.fromDF(df, glueContext, "output_dyf")
+
+# ----------------------------
+# Step 7: Run Data Quality Check (Optional)
+# ----------------------------
+
+EvaluateDataQuality().process_rows(
+    frame=output_dyf,
+    ruleset=DEFAULT_DATA_QUALITY_RULESET,
+    publishing_options={
+        "dataQualityEvaluationContext": "dq_check",
+        "enableDataQualityResultsPublishing": True
+    },
+    additional_options={
+        "dataQualityResultsPublishing.strategy": "BEST_EFFORT",
+        "observations.scope": "ALL"
+    }
+)
+
+# ----------------------------
+# Step 8: Write Enriched Data to S3
+# ----------------------------
+
+glueContext.write_dynamic_frame.from_options(
+    frame=output_dyf,
+    connection_type="s3",
+    format="glueparquet",
+    connection_options={
+        "path": "s3://sentiment-analysis-pipeline/processed/reviews/",
+        "partitionKeys": []
+    },
+    format_options={"compression": "snappy"},
+    transformation_ctx="write_to_s3"
+)
+
+# ----------------------------
+# Finish Job
+# ----------------------------
+
+job.commit()
